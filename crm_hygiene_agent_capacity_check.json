@@ -1,0 +1,679 @@
+{
+  "name": "CRM Hygiene Agent + Capacity Check",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -592,
+        384
+      ],
+      "name": "Every Monday 08:00",
+      "id": "02a29512-e89c-4f86-9b67-1b84805ac589"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select lower(first_name) as first_name,\n       lower(last_name)  as last_name,\n       email_domain,\n       count(*)                     as records,\n       string_agg(hubspot_id, ', ') as ids,\n       string_agg(email, ', ')      as emails,\n       string_agg(distinct owner, ', ') as owners\nfrom contacts\nwhere first_name <> '' and last_name <> '' and email_domain is not null\ngroup by lower(first_name), lower(last_name), email_domain\nhaving count(*) > 1\norder by count(*) desc;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -256,
+        144
+      ],
+      "name": "Q1 duplicates",
+      "id": "c289b387-0c20-4ad2-ba2f-ef32d8af87fb"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select 'No company' as problem, count(*) as records\nfrom contacts where company is null or company = ''\nunion all\nselect 'No lead source', count(*)\nfrom contacts where lead_source is null or lead_source = ''\nunion all\nselect 'Invalid or missing email', count(*)\nfrom contacts where email is null or email = '' or email not like '%_@_%._%'\nunion all\nselect 'Never touched', count(*)\nfrom contacts where last_activity is null\norder by records desc;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -256,
+        288
+      ],
+      "name": "Q2 incomplete",
+      "id": "c0d4d581-9cae-47c3-a4b1-0141ba5724a8"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select owner,\n       count(*)                                as stale_deals,\n       sum(amount)                             as value_at_risk,\n       max(current_date - last_activity::date) as longest_silence_days\nfrom deals\nwhere closed_at is null\n  and last_activity < current_date - interval '30 days'\ngroup by owner\norder by value_at_risk desc;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -256,
+        432
+      ],
+      "name": "Q3 stale deals",
+      "id": "36535864-f7b8-426b-972c-f3bb007f6b0a"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select stage,\n       count(*)    as deals,\n       sum(amount) as value,\n       round(avg(current_date - created_at::date)) as avg_age_days\nfrom deals\ngroup by stage\norder by case stage\n  when 'New' then 1 when 'Demo Booked' then 2 when 'Demo Done' then 3\n  when 'Proposal Sent' then 4 when 'Closed Won' then 5 else 6 end;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -256,
+        592
+      ],
+      "name": "Q4 funnel",
+      "id": "7ca21890-108f-423f-9bda-5d3de7784d30"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select hubspot_id, name, stage,\n       coalesce(nullif(owner, ''), '(no owner)') as owner,\n       concat_ws(', ',\n         case when owner is null or owner = ''  then 'no owner'  end,\n         case when amount is null or amount = 0 then 'no amount' end,\n         case when contact_id not in (select hubspot_id from contacts) then 'orphan' end,\n         case when closed_at is null and created_at < current_date - interval '180 days'\n              then 'open 6+ months' end\n       ) as problems\nfrom deals\nwhere owner = '' or owner is null or amount = 0 or amount is null\n   or contact_id not in (select hubspot_id from contacts)\n   or (closed_at is null and created_at < current_date - interval '180 days');",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -256,
+        752
+      ],
+      "name": "Q5 deal issues",
+      "id": "5fe3b750-99e6-4626-91cf-89df2e25d8db"
+    },
+    {
+      "parameters": {
+        "numberInputs": 5
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        336,
+        336
+      ],
+      "name": "Merge",
+      "id": "f119d3a6-cba1-4375-861b-4cff140a9e55"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pull each query's rows by node name, so order never matters\nconst rows = name => {\n  try { return $(name).all().map(i => i.json); } catch (e) { return []; }\n};\n\nconst duplicates = rows('Q1 duplicates');\nconst incomplete = rows('Q2 incomplete');\nconst stale      = rows('Q3 stale deals');\nconst funnel     = rows('Q4 funnel');\nconst issues     = rows('Q5 deal issues');\n\nconst num = v => Number(v) || 0;\n\n// Totals computed here, so the model never has to do arithmetic\nconst staleCount = stale.reduce((s, r) => s + num(r.stale_deals), 0);\nconst staleValue = stale.reduce((s, r) => s + num(r.value_at_risk), 0);\nconst worstOwner = stale.length ? stale[0].owner : null;\n\nconst stageCount = s => num((funnel.find(r => r.stage === s) || {}).deals);\nconst openDeals  = funnel.filter(r => !String(r.stage).startsWith('Closed'))\n                         .reduce((s, r) => s + num(r.deals), 0);\nconst won  = stageCount('Closed Won');\nconst lost = stageCount('Closed Lost');\nconst demoDone = stageCount('Demo Done') + stageCount('Proposal Sent') + won + lost;\nconst proposals = stageCount('Proposal Sent') + won + lost;\n\nconst pct = (a, b) => b ? Math.round(1000 * a / b) / 10 : 0;\n\nreturn [{ json: {\n  week_of: new Date().toISOString().slice(0, 10),\n  duplicates: { groups: duplicates.length, detail: duplicates },\n  incomplete: { detail: incomplete },\n  stale: { count: staleCount, value: staleValue, worst_owner: worstOwner, by_owner: stale },\n  funnel: { detail: funnel, open_deals: openDeals, won, lost,\n            demo_to_proposal_pct: pct(proposals, demoDone),\n            win_rate_pct: pct(won, won + lost) },\n  deal_issues: { count: issues.length, detail: issues }\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        384
+      ],
+      "name": "Build findings",
+      "id": "3611c337-fb93-4ea6-965e-082654b67fb9"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into weekly_snapshots\n  (week_of, duplicates, no_company, no_source, never_touched, invalid_email,\n   stale_deals, stale_value, open_deals, won_deals, win_rate_pct)\nvalues\n  ('{{ $json.week_of }}',\n   {{ $json.duplicates.groups }},\n   {{ $json.incomplete.detail.find(r => r.problem === 'No company')?.records || 0 }},\n   {{ $json.incomplete.detail.find(r => r.problem === 'No lead source')?.records || 0 }},\n   {{ $json.incomplete.detail.find(r => r.problem === 'Never touched')?.records || 0 }},\n   {{ $json.incomplete.detail.find(r => r.problem === 'Invalid or missing email')?.records || 0 }},\n   {{ $json.stale.count }},\n   {{ $json.stale.value }},\n   {{ $json.funnel.open_deals }},\n   {{ $json.funnel.won }},\n   {{ $json.funnel.win_rate_pct }})\non conflict (week_of) do update set\n  duplicates    = excluded.duplicates,\n  no_company    = excluded.no_company,\n  no_source     = excluded.no_source,\n  never_touched = excluded.never_touched,\n  invalid_email = excluded.invalid_email,\n  stale_deals   = excluded.stale_deals,\n  stale_value   = excluded.stale_value,\n  open_deals    = excluded.open_deals,\n  won_deals     = excluded.won_deals,\n  win_rate_pct  = excluded.win_rate_pct;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        880,
+        176
+      ],
+      "name": "Save snapshot",
+      "id": "73e849f9-e8d1-4a5f-87cb-5ca6803228d3"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select * from weekly_snapshots\nwhere week_of < '{{ $('Build findings').item.json.week_of }}'\norder by week_of desc\nlimit 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        880,
+        448
+      ],
+      "name": "Get last week",
+      "id": "1a12777a-d181-43d1-b440-9d1424e4e4b8",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=This week: {{ JSON.stringify($('Build findings').item.json) }}\n\nLast week: {{ JSON.stringify($json) }}",
+        "options": {
+          "systemMessage": "You write a weekly CRM health report for a sales manager at a B2B SaaS company.\n\nRules:\n- Use only the numbers given to you. Never calculate, estimate or invent a number.\n- All amounts are in EUR. Write them as \"EUR 181,000\".\n- Lead with what changed most since last week. If there is no previous week, say it is the first report and skip comparisons.\n- Last week's data contains only summary counts, not detail. Compare a number to last week only when the same field exists in both. Never warn the reader about data limitations; simply leave out comparisons you cannot make.\n- Name owners when a problem is concentrated with one person. State it as a fact, not an accusation.\n- Say what to do about each finding, in one short sentence.\n- Plain English. No buzzwords. No greeting, no sign-off. No markdown formatting, no asterisks.\n- Maximum 3 bullet points per section. Maximum 250 words.\n\nFormat:\nA one-sentence summary line, then three sections with these headings on their own line:\nPipeline at risk\nData quality\nWorth checking"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1248,
+        448
+      ],
+      "name": "Write report (AI)",
+      "id": "47d3b9fa-cde6-42f0-b161-52a383945265"
+    },
+    {
+      "parameters": {
+        "sendTo": "you@example.com",
+        "subject": "=CRM health report, week of {{ $('Build findings').item.json.week_of }}",
+        "emailType": "text",
+        "message": "={{ $json.output }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1664,
+        448
+      ],
+      "name": "Email the report",
+      "id": "9ae07c89-23d6-4f90-a695-5866f1ec1d19"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select\n  (select count(*) from contacts) as total_contacts,\n  (select count(*) from deals)    as total_deals,\n\n  (select count(*) from deals\n     where closed_at is null\n       and last_activity < current_date - interval '30 days') as stale_deals,\n\n  (select coalesce(sum(amount), 0) from deals\n     where closed_at is null\n       and last_activity < current_date - interval '30 days') as stale_value,\n\n  (select count(*) from contacts\n     where company is null or company = ''\n        or lead_source is null or lead_source = ''\n        or email is null or email = '' or email not like '%_@_%._%'\n        or last_activity is null) as incomplete_contacts,\n\n  (select count(*) from (\n      select 1 from contacts\n      where first_name <> '' and last_name <> '' and email_domain is not null\n      group by lower(first_name), lower(last_name), email_domain\n      having count(*) > 1) d) as duplicate_groups,\n\n  (select json_agg(f) from (\n      select stage, count(*) as deals, coalesce(sum(amount), 0) as value\n      from deals group by stage\n      order by case stage\n        when 'New' then 1 when 'Demo Booked' then 2 when 'Demo Done' then 3\n        when 'Proposal Sent' then 4 when 'Closed Won' then 5 else 6 end) f) as funnel,\n\n  (select json_agg(o) from (\n      select owner, count(*) as stale_deals, coalesce(sum(amount), 0) as value_at_risk\n      from deals\n      where closed_at is null and last_activity < current_date - interval '30 days'\n      group by owner order by 3 desc) o) as stale_by_owner,\n\n  (select json_agg(s) from (\n      select week_of, stale_deals, stale_value, duplicates, open_deals\n      from weekly_snapshots order by week_of desc limit 6) s) as history;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2080,
+        1040
+      ],
+      "name": "Dashboard data",
+      "id": "1d34d46c-7cc7-4ca6-830b-6819b523fe50"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $json;\nconst n = v => Number(v) || 0;\nconst arr = v => Array.isArray(v) ? v : (v ? JSON.parse(v) : []);\n\nconst funnel  = arr(d.funnel);\nconst owners  = arr(d.stale_by_owner);\nconst history = arr(d.history);\n\nconst eur = v => 'EUR ' + n(v).toLocaleString('de-DE');\n\n// Previous week comes from the snapshot history (index 1 = the week before this one)\nconst prev = history[1] || null;\nconst delta = (now, before) => {\n  if (!prev || before === undefined || before === null) return '';\n  const diff = n(now) - n(before);\n  if (diff === 0) return '<span class=\"flat\">no change</span>';\n  const cls = diff > 0 ? 'up' : 'down';\n  return `<span class=\"${cls}\">${diff > 0 ? '+' : ''}${diff.toLocaleString('de-DE')} vs last week</span>`;\n};\n\nconst maxDeals = Math.max(1, ...funnel.map(f => n(f.deals)));\n\nconst tile = (label, value, sub) =>\n  `<div class=\"tile\"><div class=\"label\">${label}</div><div class=\"value\">${value}</div><div class=\"sub\">${sub || ''}</div></div>`;\n\nconst funnelRows = funnel.map(f => `\n  <tr>\n    <td class=\"stage\">${f.stage}</td>\n    <td class=\"barcell\"><div class=\"bar\" style=\"width:${Math.round(100 * n(f.deals) / maxDeals)}%\"></div></td>\n    <td class=\"num\">${n(f.deals)}</td>\n    <td class=\"num\">${eur(f.value)}</td>\n  </tr>`).join('');\n\nconst ownerRows = owners.map(o => `\n  <tr>\n    <td>${o.owner || '(no owner)'}</td>\n    <td class=\"num\">${n(o.stale_deals)}</td>\n    <td class=\"num\">${eur(o.value_at_risk)}</td>\n  </tr>`).join('');\n\nconst historyRows = history.map(h => `\n  <tr>\n    <td>${String(h.week_of).slice(0, 10)}</td>\n    <td class=\"num\">${n(h.stale_deals)}</td>\n    <td class=\"num\">${eur(h.stale_value)}</td>\n    <td class=\"num\">${n(h.duplicates)}</td>\n    <td class=\"num\">${n(h.open_deals)}</td>\n  </tr>`).join('');\n\nconst html = `<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>CRM Health Dashboard</title>\n<style>\n  :root { --bg:#f6f7f9; --card:#fff; --ink:#1a1a1a; --muted:#6b7280;\n          --line:#e5e7eb; --bad:#b42b2b; --good:#0e6b3a; }\n  * { box-sizing:border-box; }\n  body { margin:0; padding:32px 20px; background:var(--bg); color:var(--ink);\n         font:15px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif; }\n  .wrap { max-width:960px; margin:0 auto; }\n  h1 { font-size:22px; margin:0 0 4px; }\n  .date { color:var(--muted); font-size:13px; margin-bottom:24px; }\n  h2 { font-size:15px; margin:0 0 12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }\n  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px; margin-bottom:28px; }\n  .tile { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }\n  .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }\n  .value { font-size:26px; font-weight:600; margin:6px 0 2px; }\n  .sub { font-size:12px; color:var(--muted); }\n  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; margin-bottom:22px; }\n  table { width:100%; border-collapse:collapse; font-size:14px; }\n  th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.04em;\n       color:var(--muted); font-weight:600; padding:0 8px 8px 0; }\n  td { padding:7px 8px 7px 0; border-top:1px solid var(--line); }\n  .num { text-align:right; white-space:nowrap; }\n  .stage { width:130px; }\n  .barcell { width:45%; }\n  .bar { height:10px; background:var(--good); border-radius:5px; min-width:3px; }\n  .up { color:var(--bad); } .down { color:var(--good); } .flat { color:var(--muted); }\n  footer { color:var(--muted); font-size:12px; text-align:center; margin-top:28px; }\n  @media (max-width:560px){ .barcell{display:none;} .stage{width:auto;} }\n</style>\n</head>\n<body>\n<div class=\"wrap\">\n  <h1>CRM Health Dashboard</h1>\n  <div class=\"date\">Generated ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC</div>\n\n  <div class=\"tiles\">\n    ${tile('Stale deals', n(d.stale_deals), prev ? delta(d.stale_deals, prev.stale_deals) : 'no activity 30+ days')}\n    ${tile('Value at risk', eur(d.stale_value), prev ? delta(d.stale_value, prev.stale_value) : 'in stale deals')}\n    ${tile('Duplicate groups', n(d.duplicate_groups), prev ? delta(d.duplicate_groups, prev.duplicates) : 'same person, several records')}\n    ${tile('Incomplete contacts', n(d.incomplete_contacts), 'of ' + n(d.total_contacts) + ' total')}\n  </div>\n\n  <div class=\"card\">\n    <h2>Pipeline by stage</h2>\n    <table>\n      <tr><th>Stage</th><th></th><th class=\"num\">Deals</th><th class=\"num\">Value</th></tr>\n      ${funnelRows}\n    </table>\n  </div>\n\n  <div class=\"card\">\n    <h2>Stale deals by owner</h2>\n    <table>\n      <tr><th>Owner</th><th class=\"num\">Deals</th><th class=\"num\">Value at risk</th></tr>\n      ${ownerRows || '<tr><td colspan=\"3\">Nothing stale. Good week.</td></tr>'}\n    </table>\n  </div>\n\n  <div class=\"card\">\n    <h2>Week over week</h2>\n    <table>\n      <tr><th>Week of</th><th class=\"num\">Stale</th><th class=\"num\">At risk</th><th class=\"num\">Duplicates</th><th class=\"num\">Open deals</th></tr>\n      ${historyRows || '<tr><td colspan=\"5\">No history yet.</td></tr>'}\n    </table>\n  </div>\n\n  <footer>${n(d.total_contacts)} contacts, ${n(d.total_deals)} deals. Built with n8n and Postgres.</footer>\n</div>\n</body>\n</html>`;\n\nreturn [{ json: { html } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2304,
+        1040
+      ],
+      "name": "Build HTML",
+      "id": "de0d7186-5442-4f36-a629-01578955608c"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2528,
+        1040
+      ],
+      "name": "Respond to Webhook",
+      "id": "bcec0c68-d0c7-4961-bd78-a08b85072626"
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-120b",
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        992,
+        816
+      ],
+      "id": "4c288714-82b9-468b-bc04-41e1065d08eb",
+      "name": "Groq Chat Model"
+    },
+    {
+      "parameters": {
+        "path": "crm-dashboard",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        1856,
+        1040
+      ],
+      "name": "Dashboard request",
+      "id": "45dec933-8bb1-4f21-afed-a95c533c1a35"
+    },
+    {
+      "parameters": {
+        "content": "## 1. Trigger and the 5 hygiene checks\n**Schedule:** Monday 08:00, so the report is ready before the weekly sales meeting.\n\nAll five checks run in parallel against the CRM tables:\n- **Q1 Duplicates:** same first name + last name + email domain\n- **Q2 Incomplete:** counts of contacts with no company, no lead source, invalid email, or no activity ever\n- **Q3 Stale deals:** open deals with no activity for 30+ days, grouped by owner, with Deal value at risk\n- **Q4 Funnel:** deals, value and average age per stage\n- **Q5 Deal issues:** open deals with no owner, no amount, no linked contact, or open 6+ months\n\n**RevOps point:** each rule is a visible SQL threshold, so the definition of \"stale\" can be agreed with Sales.",
+        "height": 590,
+        "width": 612,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1040,
+        -48
+      ],
+      "id": "3c6aacef-f334-4441-9144-779b9dfe207b",
+      "name": "Note 1"
+    },
+    {
+      "parameters": {
+        "content": "## 2. Combine and calculate\n**Merge** collects the five result sets.\n\n**Build findings** (code) turns the raw rows into one clean summary:\n- total stale deals and EUR value at risk\n- the owner with the most value at risk\n- open deals, won, lost\n- **win rate** = won / (won + lost)\n- **demo to proposal conversion** from the funnel stages\n\nAll maths happens here, in code, not in the AI. That is what makes the numbers reliable and auditable.\n\n**Forecasting link:** stale value, win rate and stage conversion are the inputs a forecast depends on.",
+        "height": 932,
+        "width": 360,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        256,
+        -320
+      ],
+      "id": "efafc490-0dc5-42a5-b63e-bf6d558fca1c",
+      "name": "Note 2"
+    },
+    {
+      "parameters": {
+        "content": "## 3. Memory\n**Save snapshot:** writes this week's counts to a history table (one row per week, re-runs update the same week).\n\n**Get last week:** loads the previous snapshot so the report can say what changed.\n\n**Why it matters:** one week of data is a status. Weeks of data are a trend, and trends are what a VP acts on.",
+        "height": 924,
+        "width": 272,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        800,
+        -320
+      ],
+      "id": "79ccb9c6-be25-45e0-98af-17d2d785241f",
+      "name": "Note 3"
+    },
+    {
+      "parameters": {
+        "content": "## 4. AI report and delivery\n**Write report (AI):** receives this week's findings and last week's snapshot, and writes the summary for a sales manager.\n\nGuardrails in the prompt:\n- use only the numbers provided, never calculate\n- name an owner when a problem arises\n- one short action per finding\n- max 250 words, fixed sections: Pipeline at risk, Data quality, Worth checking\n\n**Email the report:** sends it as plain text to the recipient.\n\n**Model:** open-weight model on Groq at low temperature (0.2) for consistent output.",
+        "height": 916,
+        "width": 308,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        -320
+      ],
+      "id": "39099e0e-8488-4996-a5d9-e07602f12d9c",
+      "name": "Note 4"
+    },
+    {
+      "parameters": {
+        "content": "**Groq Chat Model:** the language model connected to the AI node. Swappable (for example for Claude) without touching the rest of the flow.",
+        "height": 218,
+        "width": 538
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        624,
+        720
+      ],
+      "id": "5b76a6b0-2ea3-4fd0-a4ae-e83cf4f20f32",
+      "name": "Note 5"
+    },
+    {
+      "parameters": {
+        "content": "## 5. Live dashboard (separate flow)\n**Dashboard request:** a web address that runs the flow whenever someone opens it.\n**Dashboard data:** one SQL query returns all headline numbers at once: totals, stale deals and value, incomplete contacts, duplicate groups, funnel, stale by owner, and the last 6 weekly snapshots.\n**Build HTML:** turns the numbers into a styled page (tiles, funnel chart, owner breakdown, weekly trend).\n**Respond to Webhook:** sends the page back to the browser.\n\n**Use case:** the VP can open it any time. The email is the Monday push, the dashboard is the on-demand pull.",
+        "height": 424,
+        "width": 1188,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1632,
+        768
+      ],
+      "id": "91e4974c-c89c-42ed-b118-304561cb6c7b",
+      "name": "Note 6"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "with con as (\n  select coalesce(nullif(owner,''),'(no owner)') as owner,\n         count(*) as contacts,\n         count(distinct lower(company)) filter (where company <> '') as accounts\n  from contacts group by 1),\ndl as (\n  select coalesce(nullif(owner,''),'(no owner)') as owner,\n         count(*) filter (where closed_at is null) as open_deals,\n         coalesce(sum(amount) filter (where closed_at is null),0) as open_pipeline,\n         coalesce(sum(amount) filter (where stage='Closed Won'),0) as won_value\n  from deals group by 1)\nselect coalesce(con.owner, dl.owner) as owner,\n       coalesce(con.contacts,0)      as contacts,\n       coalesce(con.accounts,0)      as accounts,\n       coalesce(dl.open_deals,0)     as open_deals,\n       coalesce(dl.open_pipeline,0)  as open_pipeline,\n       coalesce(dl.won_value,0)      as won_value\nfrom con full join dl on con.owner = dl.owner\norder by open_pipeline desc;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -672,
+        1536
+      ],
+      "id": "4ae9d2b4-56dd-44ce-8874-1dc12156e99a",
+      "name": "Territory balance"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Territory balance check: compares each AE to the team average.\n// Index 100 = exactly average. Above 125 = overloaded, below 75 = underloaded.\nconst HIGH = 125, LOW = 75;\n\nconst rows = $input.all().map(i => i.json);\nconst num = v => Number(v) || 0;\n\nconst owned   = rows.filter(r => r.owner !== '(no owner)');\nconst unowned = rows.find(r => r.owner === '(no owner)');\n\nconst avg = f => owned.length\n  ? owned.reduce((s, r) => s + num(r[f]), 0) / owned.length : 0;\nconst avgAccounts = avg('accounts');\nconst avgPipeline = avg('open_pipeline');\n\nconst index  = (v, a) => a ? Math.round(100 * num(v) / a) : 0;\nconst status = i => i > HIGH ? 'overloaded' : i < LOW ? 'underloaded' : 'balanced';\n\nconst reps = owned.map(r => {\n  const account_index  = index(r.accounts, avgAccounts);\n  const pipeline_index = index(r.open_pipeline, avgPipeline);\n  return {\n    owner: r.owner,\n    accounts: num(r.accounts),\n    open_deals: num(r.open_deals),\n    open_pipeline: num(r.open_pipeline),\n    account_index, pipeline_index,\n    account_status: status(account_index),\n    pipeline_status: status(pipeline_index)\n  };\n});\n\nconst flagged = reps.filter(r =>\n  r.account_status !== 'balanced' || r.pipeline_status !== 'balanced');\n\nreturn [{ json: {\n  avg_accounts: Math.round(avgAccounts),\n  avg_open_pipeline: Math.round(avgPipeline),\n  reps,\n  flagged,\n  unowned: { accounts: num(unowned && unowned.accounts),\n             open_pipeline: num(unowned && unowned.open_pipeline) }\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -512,
+        1536
+      ],
+      "id": "7321218a-8217-48c8-a31d-63d769d54d9a",
+      "name": "Balance check"
+    },
+    {
+      "parameters": {
+        "jsCode": "const t = $input.first().json;\nconst eur = n => 'EUR ' + Math.round(Number(n) || 0).toLocaleString('en-US');\n\nconst lines = [];\nlines.push(`Territory balance: ${t.reps.length} AEs, on average ${t.avg_accounts} accounts and ${eur(t.avg_open_pipeline)} open pipeline each.`);\nlines.push('');\n\n// One line per AE\nfor (const r of t.reps) {\n  lines.push(`${r.owner}: ${r.accounts} accounts (${r.account_index}% of average, ${r.account_status}), ` +\n             `${eur(r.open_pipeline)} open pipeline in ${r.open_deals} deals (${r.pipeline_index}% of average, ${r.pipeline_status}).`);\n}\n\n// What to do about it\nconst actions = [];\nfor (const r of t.reps) {\n  if (r.account_index > 100 && r.pipeline_index < 75) {\n    actions.push(`${r.owner} has an above-average account count but well below-average pipeline. Check account quality and follow-up before adding more accounts.`);\n  } else if (r.pipeline_status === 'overloaded') {\n    actions.push(`${r.owner} carries more pipeline than average. Check capacity and consider moving some deals.`);\n  } else if (r.pipeline_status === 'underloaded') {\n    actions.push(`${r.owner} has less pipeline than average. Consider assigning more opportunities or focusing on pipeline generation.`);\n  }\n  if (r.account_status === 'overloaded') {\n    actions.push(`${r.owner} holds more accounts than average. Consider moving some to a rep with room.`);\n  } else if (r.account_status === 'underloaded') {\n    actions.push(`${r.owner} holds fewer accounts than average and has room for more.`);\n  }\n}\nif (t.unowned.accounts > 0) {\n  actions.push(`${t.unowned.accounts} accounts (${eur(t.unowned.open_pipeline)} open pipeline) have no owner. Assign them.`);\n}\n\nlines.push('');\nlines.push(actions.length ? 'What to look at:' : 'All territories are within the balanced range.');\nfor (const a of actions) lines.push('- ' + a);\n\nconst week_of = new Date().toISOString().slice(0, 10);   // e.g. 2026-10-04\nreturn [{ json: { week_of, summary: lines.join('\\n') } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -352,
+        1536
+      ],
+      "id": "1bf58481-34f9-4408-894e-da7fa8aec053",
+      "name": "Write summary"
+    },
+    {
+      "parameters": {
+        "sendTo": "you@example.com",
+        "subject": "=Territory balance check, week of {{ $json.week_of }}",
+        "emailType": "text",
+        "message": "={{ $json.summary }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        -192,
+        1536
+      ],
+      "id": "babe25d9-5902-47bc-a4c5-87611441e243",
+      "name": "Send a message"
+    },
+    {
+      "parameters": {
+        "content": "## 6. Territory balance check (add-on)\n**Purpose:** show whether accounts and pipeline are split fairly between AEs, as a starting point for territory planning.\n\n**Territory balance** (SQL): per AE, counts accounts (distinct companies), open deals, open pipeline in EUR and won value. Records with no owner are kept separate.\n\n**Balance check** (code): compares each AE to the team average. \nIndex 100 = average. Above 125 = overloaded, below 75 = underloaded, for both accounts and pipeline.\n\n**Write summary** (code): turns the numbers into plain sentences, one line per AE plus recommended actions. Rule-based, no AI, so the wording is consistent.\n\n**Send a message** (Gmail): emails the summary as plain text.\n\n**Why both metrics:** an AE can hold many accounts but little pipeline. Equal account counts alone would hide that.\n\n**Next step:** weight accounts by size and region, and add this to the weekly report.",
+        "height": 688,
+        "width": 752,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -704,
+        1024
+      ],
+      "id": "b7b5c812-c45f-4365-965e-190509f9aab6",
+      "name": "Note 7 territory"
+    }
+  ],
+  "connections": {
+    "Every Monday 08:00": {
+      "main": [
+        [
+          {
+            "node": "Q1 duplicates",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Q2 incomplete",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Q3 stale deals",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Q4 funnel",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Q5 deal issues",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Territory balance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q1 duplicates": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Q2 incomplete": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Q3 stale deals": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Q4 funnel": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Q5 deal issues": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Build findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build findings": {
+      "main": [
+        [
+          {
+            "node": "Save snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save snapshot": {
+      "main": [
+        [
+          {
+            "node": "Get last week",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get last week": {
+      "main": [
+        [
+          {
+            "node": "Write report (AI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write report (AI)": {
+      "main": [
+        [
+          {
+            "node": "Email the report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dashboard data": {
+      "main": [
+        [
+          {
+            "node": "Build HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build HTML": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Write report (AI)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dashboard request": {
+      "main": [
+        [
+          {
+            "node": "Dashboard data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Territory balance": {
+      "main": [
+        [
+          {
+            "node": "Balance check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Balance check": {
+      "main": [
+        [
+          {
+            "node": "Write summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write summary": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "pinData": {}
+}
