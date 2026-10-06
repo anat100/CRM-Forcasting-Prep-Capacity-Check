@@ -173,9 +173,6 @@ Add your screenshots to `docs/screenshots/` and reference them here:
     └── screenshots/
 ```
 
-## License
-
-MIT, see [LICENSE](LICENSE). Check the license of the original project linked above and make sure this one is compatible with it.
 
 ## Acknowledgements
 
